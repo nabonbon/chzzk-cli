@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# 치지직 방송을 mpv(하드웨어 디코딩)로 재생 + 채팅을 별도 터미널 창에 팝업
+# 사용법: chzzk [-q 1080|720|480] <채널ID | 라이브 URL | 채널명 검색어>
+set -uo pipefail
+
+usage() {
+  echo "사용법: chzzk [-q 1080|720|480] [-l 일반|저지연] <채널ID | URL | 채널명 검색어>" >&2
+  echo "  -q, --quality   해상도: 1080 | 720 | 480  (생략=최고화질, 값없이 -q=대화형 선택)" >&2
+  echo "  -l, --latency   지연모드: 일반(normal) | 저지연(low)  (생략=일반, 값없이 -l=대화형)" >&2
+  echo "  -set            채팅 전송용 로그인 쿠키 등록(NID_AUT → NID_SES 순서로 대화형 입력)" >&2
+  echo "  -i              현재 로그인 쿠키 등록 상태 확인 (값은 마스킹 표시)" >&2
+  echo "  예1) chzzk 풍월량                     검색→선택, 최고화질·일반" >&2
+  echo "  예2) chzzk -q 720 풍월량              720p·일반" >&2
+  echo "  예3) chzzk -q 720 -l 저지연 풍월량    720p·저지연" >&2
+  echo "  예4) chzzk -q -l 풍월량               해상도·지연모드 모두 대화형 선택" >&2
+  echo "  예5) chzzk -set                       채팅 전송 로그인 쿠키 등록" >&2
+  echo "  예6) chzzk -i                         현재 로그인 상태 확인" >&2
+}
+
+# ── 로그인 쿠키 등록 (대화형): chzzk -set ──
+if [ "${1:-}" = "-set" ] || [ "${1:-}" = "--set" ]; then
+  exec python3 "$HOME/.local/bin/chzzk-login.py" --set
+fi
+
+# ── 현재 로그인 쿠키 상태 확인: chzzk -i ──
+if [ "${1:-}" = "-i" ] || [ "${1:-}" = "--info" ]; then
+  exec python3 "$HOME/.local/bin/chzzk-login.py" --status
+fi
+
+# ── 인자 파싱: -q(해상도) / -l(지연모드), 값 생략 시 대화형 선택 ──
+quality=""        # 1080 | 720 | 480 | "" (=최고)
+latency="normal"  # normal | low
+ask_quality=0
+ask_latency=0
+positional=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -q|--quality|-r|--res)
+      case "${2:-}" in
+        1080|720|480) quality="$2"; shift 2 ;;
+        best|max)     quality="";  shift 2 ;;
+        *)            ask_quality=1; shift ;;   # 값 없거나 해상도 아니면 대화형
+      esac ;;
+    -q=*|--quality=*|-r=*|--res=*)
+      quality="${1#*=}"; shift ;;
+    -l|--latency)
+      case "${2:-}" in
+        normal|일반|hls)      latency="normal"; shift 2 ;;
+        low|저지연|ll|lowlatency) latency="low";  shift 2 ;;
+        *)                    ask_latency=1; shift ;;  # 값 없거나 모르면 대화형
+      esac ;;
+    -l=*|--latency=*)
+      v="${1#*=}"
+      case "$v" in low|저지연|ll) latency="low";; *) latency="normal";; esac
+      shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "알 수 없는 옵션: $1" >&2; usage; exit 1 ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+set -- "${positional[@]:-}"
+arg="${*:-}"
+
+if [ -z "${arg// }" ]; then
+  usage; exit 1
+fi
+
+# 해상도 값 유효성 검사
+if [ -n "$quality" ] && [[ ! "$quality" =~ ^(1080|720|480)$ ]]; then
+  echo "오류: -q 값은 1080, 720, 480 중 하나여야 합니다 (입력: '$quality')" >&2
+  exit 1
+fi
+
+# 대화형 해상도 선택 (-q 만 주고 값 생략 시)
+if [ "$ask_quality" = 1 ]; then
+  { echo "해상도 선택:"; echo "  1) 1080p"; echo "  2) 720p"; echo "  3) 480p"; } >&2
+  printf "선택 [기본 1]: " >&2
+  if [ -r /dev/tty ]; then read -r sel </dev/tty; else read -r sel; fi
+  case "${sel:-1}" in
+    1|1080) quality="1080" ;;
+    2|720)  quality="720" ;;
+    3|480)  quality="480" ;;
+    *) echo "잘못된 선택입니다." >&2; exit 1 ;;
+  esac
+fi
+
+# 대화형 지연모드 선택 (-l 만 주고 값 생략 시)
+if [ "$ask_latency" = 1 ]; then
+  { echo "지연모드 선택:"; echo "  1) 일반  (버퍼 넉넉·안정적, 지연 몇 초)"; echo "  2) 저지연 (지연 최소·끊김 위험)"; } >&2
+  printf "선택 [기본 1]: " >&2
+  if [ -r /dev/tty ]; then read -r sel </dev/tty; else read -r sel; fi
+  case "${sel:-1}" in
+    1|일반|normal) latency="normal" ;;
+    2|저지연|low)  latency="low" ;;
+    *) echo "잘못된 선택입니다." >&2; exit 1 ;;
+  esac
+fi
+
+# 채널ID 추출: URL이면 도메인/ live/ 를 벗겨내고, 아니면 그대로 ID로 간주
+raw="$arg"
+if [[ "$raw" == *chzzk.naver.com/* ]]; then
+  raw="${raw##*chzzk.naver.com/}"   # 도메인 뒤 전부
+  raw="${raw#live/}"                 # 앞의 live/ 제거
+  raw="${raw%%[/?#]*}"              # 첫 / ? # 앞까지만
+fi
+id="$raw"
+
+# ID 형식(hex)이 아니면 검색어로 간주 → 검색 후 선택
+if ! [[ "$id" =~ ^[0-9a-fA-F]{20,}$ ]]; then
+  id="$(python3 "$HOME/.local/bin/chzzk-search.py" "$arg")" || exit 1
+  if ! [[ "$id" =~ ^[0-9a-fA-F]{20,}$ ]]; then
+    echo "채널을 선택하지 못했습니다." >&2
+    exit 1
+  fi
+fi
+url="https://chzzk.naver.com/live/$id"
+chat="$HOME/.local/bin/chzzk-chat.py"
+
+# 채팅 팝업 (독립 터미널 창)
+if command -v xfce4-terminal >/dev/null; then
+  xfce4-terminal --disable-server --title="치지직 채팅" --geometry=52x46 \
+    --command="python3 $chat $id" &
+elif command -v xterm >/dev/null; then
+  xterm -T "치지직 채팅" -geometry 52x46 -e python3 "$chat" "$id" &
+else
+  echo "※ 터미널 에뮬레이터가 없어 채팅은 이 창에 출력합니다." >&2
+  python3 "$chat" "$id" &
+fi
+chat_pgid=$!
+
+# 지연모드에 맞는 포맷 접두사: 일반=hls-N, 저지연=hls-ll-N
+if [ "$latency" = "low" ]; then
+  pref="^hls-ll-"
+else
+  pref="^hls-[0-9]"
+fi
+# 해상도 필터 (지정 시 height 상한)
+hfilter=""
+[ -n "$quality" ] && hfilter="[height<=$quality]"
+
+ytf=(--ytdl-format="best${hfilter}[format_id~='${pref}']/best${hfilter}/best")
+
+# 저지연 모드: mpv 내장 profile=low-latency는 audio-buffer=0 · stream-buffer-size=4k ·
+# cache-pause=no 등 LAN 전용급 공격적인 값이라, 인터넷 스트림에서 네트워크가 조금만
+# 흔들려도 오디오 언더런이 나며 싱크가 누적되어 밀린다(profile=low-latency 그대로 두면
+# "일반" 모드에서 이미 겪었던 것과 같은 문제). 대신 여유를 살짝 남긴 짧은 버퍼 +
+# cache-pause=yes(버퍼가 비면 잠깐 멈췄다 재생)로 지연은 짧게 유지하면서 안정성을 확보한다.
+mpvopts=()
+if [ "$latency" = "low" ]; then
+  mpvopts+=(
+    --demuxer-readahead-secs=3
+    --demuxer-max-bytes=24MiB
+    --demuxer-max-back-bytes=8MiB
+    --cache-pause=yes
+    --cache-pause-wait=1
+  )
+fi
+
+echo "▶ 재생: 해상도 ${quality:-최고}, 지연모드 $([ "$latency" = low ] && echo 저지연 || echo 일반)" >&2
+
+# mpv 영상 재생 (종료될 때까지 대기). ~/.config/mpv/mpv.conf의 기본 설정 사용
+mpv "${ytf[@]}" "${mpvopts[@]}" "$url"
+
+# mpv 종료 시 채팅 클라이언트도 정리
+pkill -f "chzzk-chat.py $id" 2>/dev/null || true
+kill "$chat_pgid" 2>/dev/null || true

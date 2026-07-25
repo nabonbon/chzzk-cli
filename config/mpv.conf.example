@@ -1,0 +1,14 @@
+# 하드웨어 디코딩 (Haswell VAAPI). HEVC 등 미지원 코덱은 자동으로 소프트웨어 폴백
+hwdec=auto-safe
+vo=gpu
+
+# 라이브 스트림 안정화 (저사양 + 네트워크 변동 대비)
+# ※ 이전의 profile=low-latency 는 버퍼를 거의 두지 않아
+#   저사양/네트워크 변동 시 오디오 언더런·'Cannot seek'·멈춤을 유발 → 제거함.
+cache=yes
+demuxer-max-bytes=128MiB
+demuxer-max-back-bytes=32MiB
+demuxer-readahead-secs=15
+cache-pause=yes            # 버퍼가 마르면 잠깐 멈춰 다시 채움(뚝뚝 끊김 대신)
+cache-pause-wait=2         # 2초어치 채워지면 재생 재개
+force-seekable=yes         # 라이브 재동기화 시 'Cannot seek' 메시지 스팸 방지
